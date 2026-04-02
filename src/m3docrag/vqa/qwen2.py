@@ -30,6 +30,9 @@ def init(
     attn_implementation="flash_attention_2",
     **kwargs,
 ):
+    # For 4-bit inference, FP16 typically uses less VRAM than BF16 on consumer GPUs.
+    if bits == 4 and dtype == torch.bfloat16:
+        dtype = torch.float16
     if bits == 4:
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
@@ -49,7 +52,13 @@ def init(
         vision_config={"torch_dtype": dtype}
     )
     model.eval()
-    processor = AutoProcessor.from_pretrained(model_name_or_path)
+    # Reduce visual token count to avoid CUDA OOM.
+    # Qwen2-VL processor supports min_pixels/max_pixels knobs.
+    max_pixels = int(kwargs.pop("max_pixels", 512 * 512))
+    min_pixels = int(kwargs.pop("min_pixels", 256 * 256))
+    processor = AutoProcessor.from_pretrained(
+        model_name_or_path, min_pixels=min_pixels, max_pixels=max_pixels
+    )
 
     return {
         'model': model,
@@ -88,7 +97,8 @@ def generate(
     inputs = inputs.to(p.device)
 
     # Inference
-    generated_ids = model.generate(**inputs, max_new_tokens=128, do_sample=False)
+    with torch.inference_mode():
+        generated_ids = model.generate(**inputs, max_new_tokens=64, do_sample=False)
     generated_ids_trimmed = [
         out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
     ]

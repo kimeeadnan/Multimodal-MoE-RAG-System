@@ -22,13 +22,13 @@ from icecream import ic
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
 
-    # Data settings
-    split: str = 'train'
+    # Data settings (default dev: matches MMQA_dev + typical colpali_*_dev embeddings; use --split=train if you embedded all train docs)
+    split: str = 'dev'
     data_name: str = field(default='m3-docvqa', metadata={"help": "Local name to be stored at LOCAL_DATA_DIR"})
     data_len: int = field(default=None, metadata={"help": "number of examples to subsample from dataset"})
     use_dummy_images: bool = field(default=False, metadata={"help": "if true, skip downloading images"})
     load_embedding: bool = False
-    embedding_name: str = "colpali-v1.2_m3-docvqa_dev"
+    embedding_name: str = "colpali_m3docvqa_dev"
 
     max_pages: int = 20
     do_page_padding: bool = False
@@ -40,8 +40,39 @@ class TrainingArguments(transformers.TrainingArguments):
     page_retrieval_type: str = 'logits'
     loop_unique_doc_ids: bool = field(default=False, metadata={"help": "if true, apply retrieval only on unique doc ids"})
 
-    n_retrieval_pages: int = 1
+    n_retrieval_pages: int = field(
+        default=3,
+        metadata={
+            "help": "Top pages passed to the VLM after ColPali+FAISS MaxSim. "
+            "Use 1 for minimal VRAM smoke tests; 3–5 often helps recall if memory allows."
+        },
+    )
 
+    faiss_search_k: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "FAISS neighbors retrieved per query token for ColPali MaxSim. "
+            "None = max(64, n_retrieval_pages * 16). Must be >= n_retrieval_pages."
+        },
+    )
+    faiss_nprobe: int = field(
+        default=16,
+        metadata={
+            "help": "IVF nprobe at query time (ivfflat / ivfpq only). Ignored for flatip. "
+            "Higher improves recall, slower search. Typical range 8–64."
+        },
+    )
+
+    use_weaviate_router: bool = field(
+        default=False,
+        metadata={
+            "help": "If true, keyword/text routes query Weaviate for top doc IDs and narrow ColPali+FAISS to those docs."
+        },
+    )
+    weaviate_top_k_docs: int = field(
+        default=20,
+        metadata={"help": "Max distinct doc_ids to keep from Weaviate for keyword/text routes."},
+    )
 
     # Embedding indexing settings
     faiss_index_type: str = field(default='ivfflat', metadata={"choices": ['flatip', 'ivfflat', 'ivfpq']})

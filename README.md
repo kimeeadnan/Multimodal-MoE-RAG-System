@@ -165,6 +165,72 @@ python examples/run_rag_m3docvqa.py \
     --output_dir=/job/eval_outputs/$OUTPUT_SAVE_NAME
 ```
 
+# Current project progress (this repo state)
+
+This section tracks what is currently implemented in this working tree for the multimodal MoE-RAG direction.
+
+## 1) Completed pipeline pieces
+
+- **ColPali visual embeddings** for M3DocVQA pages are generated and stored.
+- **FAISS visual index** is built from ColPali embeddings.
+- **Weaviate text/keyword index** is added for MMQA text chunks.
+- **MoE router** is implemented with three experts:
+  - `visual`
+  - `text`
+  - `keyword`
+- **RAG planning flow** now includes routing reason/features and optional Weaviate doc-id filters.
+- **Generation model path** uses Qwen2-VL in the RAG script.
+
+## 2) Routing and retrieval behavior
+
+- Router logic is in `src/m3docrag/routing/moe_router.py`.
+- Visual routing is now guarded by explicit structural cues (`page`, `figure`, `table`) to reduce false positives.
+- Keyword routing includes short-entity/factoid/WH/numeric-style question rules.
+- Router outputs are logged in results as:
+  - `router_expert`
+  - `router_reason`
+  - `router_features`
+  - `router_doc_ids_filter`
+- For `text` / `keyword`, Weaviate can narrow candidate doc IDs before ColPali+FAISS retrieval.
+- For `visual`, retrieval keeps full-corpus behavior (no Weaviate doc filter).
+
+## 3) Weaviate integration updates
+
+- Added Weaviate retrieval helpers under `src/m3docrag/retrieval/`.
+- Weaviate default ports were aligned with `docker-compose.weaviate.yml`:
+  - HTTP: `8090`
+  - gRPC: `50052`
+- BGE retrieval path uses hybrid search fallback (`vector + BM25`) in this environment because plain `near_vector` may return no hits.
+
+## 4) Stability / quality updates
+
+- Added router regression tests in `tests/test_moe_router.py`.
+- Added safer Weaviate client cleanup (`try/finally`) in `examples/run_rag_m3docvqa.py`.
+- Added safer flash-attention capability check (`supports_flash_attention`) so missing `flash_attn` does not crash model init.
+- Added memory-aware behavior for generation runs:
+  - Keep retrieval model on CPU during VQA stage.
+  - 4-bit path for Qwen2-VL.
+  - Lower-VRAM defaults in Qwen2 wrapper (reduced visual token budget and shorter generation).
+
+## 5) Current limitations (important)
+
+- **Single-GPU memory remains the main bottleneck.**
+  - Full multimodal generation can still be slow and fragile on 12-16 GB GPUs depending on image/page complexity.
+- **Evaluation startup is heavy.**
+  - Loading all doc embeddings/index data can take significant time before first answer generation.
+- **Router is rule-based (not learned).**
+  - It improves control and diversity but may still misroute edge-case questions.
+- **Weaviate dependency is operationally sensitive.**
+  - Correct host/ports and running docker services are required for routed text/keyword filtering.
+- **Smoke runs may succeed while larger runs still fail/timeout.**
+  - Current settings prioritize "can run on limited VRAM" over throughput.
+
+## 6) Recommended run mode for now
+
+- Use **small smoke runs first** (`--data_len` small, `--bits=4`, `--n_retrieval_pages=1`).
+- Increase scale only after confirming no OOM in your local GPU session.
+- Keep Weaviate enabled only when text/keyword routing quality is being tested.
+
 # Citation
 
 Please cite our paper if you use our dataset and/or method in your projects.

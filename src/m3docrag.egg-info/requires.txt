@@ -23,6 +23,8 @@ colpali-engine==0.3.1
 easyocr
 qwen-vl-utils
 faiss-cpu
+weaviate-client>=4.4.0
+sentence-transformers>=2.2.0
 word2number
 datasets>=3.0.0
 python-dotenv

@@ -15,7 +15,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
-from typing import List, Dict, Tuple
+from typing import AbstractSet, Dict, List, Optional, Tuple
 from tqdm.auto import tqdm
 import torch
 import numpy as np
@@ -59,8 +59,10 @@ class RAGModelBase:
         all_token_embeddings = None,
 
         n_return_pages: int = 1,
+        faiss_search_k: Optional[int] = None,
         single_page_from_each_doc: bool = False,
         show_progress=False,
+        allowed_doc_ids: Optional[AbstractSet[str]] = None,
     ) -> List[Tuple]:
         """
         Given text query and pre-extracted document embedding,
@@ -87,9 +89,14 @@ class RAGModelBase:
             query_emb = self.retrieval_model.encode_queries([query])[0]
             query_emb = query_emb.cpu().float().numpy().astype(np.float32)
 
-            # NN search
-            k = n_return_pages
-            D, I = index.search(query_emb, k)
+            # Neighbors per query token for MaxSim (must be >> n_return_pages so
+            # different pages can compete; using only n_return_pages was too small).
+            nn_k = faiss_search_k if faiss_search_k is not None else max(
+                64, n_return_pages * 16
+            )
+            nn_k = max(nn_k, n_return_pages)
+
+            D, I = index.search(query_emb, nn_k)
 
             # Sum the MaxSim scores across all query tokens for each document
             final_page2scores = {}
@@ -100,14 +107,19 @@ class RAGModelBase:
                 # Initialize a dictionary to hold document relevance scores
                 curent_q_page2scores = {}
 
-                for nn_idx in range(k):
+                for nn_idx in range(nn_k):
                     found_nearest_doc_token_idx = I[q_idx, nn_idx]
 
                     page_uid = token2pageuid[found_nearest_doc_token_idx]  # Get the document ID for this token
 
-                    # reconstruct the original score
-                    doc_token_emb = all_token_embeddings[found_nearest_doc_token_idx]
-                    score = (query_emb * doc_token_emb).sum()
+                    # Use FAISS score directly when full token matrix is not provided.
+                    # This avoids holding a giant all_token_embeddings array in memory.
+                    if all_token_embeddings is None:
+                        score = float(D[q_idx, nn_idx])
+                    else:
+                        # Reconstruct exact score from token embedding.
+                        doc_token_emb = all_token_embeddings[found_nearest_doc_token_idx]
+                        score = (query_emb * doc_token_emb).sum()
 
                     # MaxSim: aggregate the highest similarity score for each query token per document
                     if page_uid not in curent_q_page2scores:
@@ -125,10 +137,22 @@ class RAGModelBase:
             # Sort documents by their final relevance score
             sorted_pages = sorted(final_page2scores.items(), key=lambda x: x[1], reverse=True)
 
-            # Get the top-k document candidates
-            top_k_pages = sorted_pages[:k]
+            def _doc_from_uid(uid: str) -> str:
+                return uid.split("_page")[0]
 
-            
+            if allowed_doc_ids is not None and len(allowed_doc_ids) > 0:
+                filtered = [
+                    (u, s)
+                    for u, s in sorted_pages
+                    if _doc_from_uid(u) in allowed_doc_ids
+                ]
+                if filtered:
+                    sorted_pages = filtered
+                # else: keep unfiltered sorted_pages (no Weaviate overlap with PDF corpus)
+
+            # Get the top-k document candidates (pages, not FAISS neighbors)
+            top_k_pages = sorted_pages[:n_return_pages]
+
             # [(doc_id, page_idx, scores)...]
 
             sorted_results = []
@@ -138,16 +162,22 @@ class RAGModelBase:
                 # page_uid = f"{doc_id}_page{page_id}"
                 doc_id = page_uid.split('_page')[0]
                 page_idx = int(page_uid.split('_page')[-1])
-                sorted_results.append((doc_id, page_idx, score.item()))
+                sorted_results.append((doc_id, page_idx, float(score)))
 
             return sorted_results
 
+        doc_source = docid2embs
+        if allowed_doc_ids is not None and len(allowed_doc_ids) > 0:
+            sub = {k: v for k, v in docid2embs.items() if k in allowed_doc_ids}
+            if sub:
+                doc_source = sub
+
         docid2scores = {}
         for doc_id, doc_embs in tqdm(
-            docid2embs.items(),
-            total=len(docid2embs),
-            disable = not show_progress,
-            desc=f"Calculating similarity score over documents"
+            doc_source.items(),
+            total=len(doc_source),
+            disable=not show_progress,
+            desc="Calculating similarity score over documents",
         ):
             doc_lens = None
             if docid2lens is not None:

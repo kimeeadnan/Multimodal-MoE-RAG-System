@@ -21,6 +21,7 @@ from pathlib import Path
 
 import accelerate
 import pytz
+import safetensors
 import torch
 import transformers
 from accelerate import Accelerator
@@ -31,6 +32,11 @@ from tqdm import tqdm
 from m3docrag.datasets.m3_docvqa import M3DocVQADataset, evaluate_prediction_file
 from m3docrag.rag import MultimodalRAGModel
 from m3docrag.retrieval import ColPaliRetrievalModel
+from m3docrag.routing.moe_router import features_to_dict
+from m3docrag.routing.rag_plan import (
+    build_retrieval_plan,
+    enrich_plan_with_weaviate_doc_ids,
+)
 from m3docrag.utils.args import parse_args
 from m3docrag.utils.distributed import (
     barrier,
@@ -62,6 +68,8 @@ def run_model(
     all_token_embeddings=None,
     n_return_pages=1,
     args=None,
+    weaviate_client=None,
+    weaviate_embed_model=None,
 ):
     # if type(datum['num_pages']) == list:
     batch = datum
@@ -73,10 +81,30 @@ def run_model(
 
     out_dict = {}
 
+    plan = build_retrieval_plan(query)
+    if args.use_weaviate_router:
+        plan = enrich_plan_with_weaviate_doc_ids(
+            plan,
+            query,
+            weaviate_client,
+            weaviate_embed_model,
+            top_k_docs=args.weaviate_top_k_docs,
+        )
+    qid = datum.get("qid", "")
+    logger.info(
+        f"router expert={plan.expert} reason={plan.reason!r} qid={qid!r} "
+        f"weaviate_docs={len(plan.doc_ids_filter or [])} query={query[:120]!r}..."
+    )
+    out_dict["router_expert"] = plan.expert
+    out_dict["router_reason"] = plan.reason
+    out_dict["router_features"] = features_to_dict(plan.features)
+    out_dict["router_doc_ids_filter"] = plan.doc_ids_filter
+
+    allowed = frozenset(plan.doc_ids_filter) if plan.doc_ids_filter else None
+
     start = time.perf_counter()
 
-    # Stage 1: Page retrieval
-    # [(doc_id, page_idx, scores)...]
+    # Stage 1: Page retrieval (optional Weaviate doc filter for keyword/text)
     top_n_page_retrieval_results = rag_model.retrieve_pages_from_docs(
         query=query,
         docid2embs=docid2embs,
@@ -85,7 +113,9 @@ def run_model(
         token2pageuid=token2pageuid,
         all_token_embeddings=all_token_embeddings,
         n_return_pages=n_return_pages,
+        faiss_search_k=args.faiss_search_k,
         show_progress=True,
+        allowed_doc_ids=allowed,
     )
     logger.info(top_n_page_retrieval_results)
     out_dict["page_retrieval_results"] = top_n_page_retrieval_results
@@ -136,41 +166,63 @@ def run_model(
     return out_dict
 
 
-def evaluate(data_loader, rag_model, index=None, data_len=None, args=None, **kwargs):
+def evaluate(
+    data_loader,
+    rag_model,
+    index=None,
+    data_len=None,
+    args=None,
+    weaviate_client=None,
+    weaviate_embed_model=None,
+    **kwargs,
+):
     if data_len is not None:
         logger.info(f"eval on the first {data_len} items")
 
     # docid2embs = data_loader.dataset.load_all_embeddings()
 
     logger.info("Preparing doc indices")
-
-    if args.retrieval_model_type == "colpali":
-        docid2embs = data_loader.dataset.load_all_embeddings()
-
-    #  reduce_embeddings(docid2embs=docid2embs)
-    # docid2embs_page_reudced = reduce_embeddings(docid2embs, dim='page')
-    # docid2embs_token_reudced = reduce_embeddings(docid2embs, dim='token')
-    # docid2embs_page_token_reudced = reduce_embeddings(docid2embs, dim='page_token')
-
-    all_token_embeddings = []
+    docid2embs = {}
     token2pageuid = []
+    all_token_embeddings = None
 
-    if args.retrieval_model_type == "colpali":
+    # Low-memory full pipeline mode:
+    # when FAISS index exists, avoid loading all page embeddings into one giant matrix.
+    if args.retrieval_model_type == "colpali" and index is not None:
+        emb_dir = Path(LOCAL_EMBEDDINGS_DIR) / args.embedding_name
+        for doc_id in tqdm(
+            data_loader.dataset.all_supporting_doc_ids,
+            total=len(data_loader.dataset.all_supporting_doc_ids),
+            desc="Building token->page mapping",
+        ):
+            emb_path = emb_dir / f"{doc_id}.safetensors"
+            if not emb_path.exists():
+                continue
+            with safetensors.safe_open(str(emb_path), framework="pt", device="cpu") as f:
+                # Prefer metadata-only shape path; fallback is safe.
+                try:
+                    n_pages, n_tokens, _ = f.get_slice("embeddings").get_shape()
+                except Exception:
+                    n_pages, n_tokens, _ = f.get_tensor("embeddings").shape
+            for page_id in range(int(n_pages)):
+                page_uid = f"{doc_id}_page{page_id}"
+                token2pageuid.extend([page_uid] * int(n_tokens))
+        logger.info(f"Built token2pageuid entries: {len(token2pageuid)}")
+        logger.info("Using FAISS scores directly (skip all_token_embeddings reconstruction)")
+    elif args.retrieval_model_type == "colpali":
+        # Fallback path when index is missing: keep original brute-force behavior.
+        docid2embs = data_loader.dataset.load_all_embeddings()
+        all_token_embeddings_list = []
         for doc_id, doc_emb in tqdm(docid2embs.items(), total=len(docid2embs)):
-            # e.g., doc_emb - torch.Size([9, 1030, 128])
             for page_id in range(len(doc_emb)):
                 page_emb = doc_emb[page_id].view(-1, 128)
-                all_token_embeddings.append(page_emb)
-
+                all_token_embeddings_list.append(page_emb)
                 page_uid = f"{doc_id}_page{page_id}"
                 token2pageuid.extend([page_uid] * page_emb.shape[0])
-
-    logger.info(len(all_token_embeddings))
-
-    all_token_embeddings = torch.cat(all_token_embeddings, dim=0)
-    all_token_embeddings = all_token_embeddings.float().numpy()
-
-    logger.info("Created flattened token embeddings / token2pageuid")
+        logger.info(len(all_token_embeddings_list))
+        all_token_embeddings = torch.cat(all_token_embeddings_list, dim=0)
+        all_token_embeddings = all_token_embeddings.float().numpy()
+        logger.info("Created flattened token embeddings / token2pageuid")
 
     qid2result = {}
 
@@ -190,14 +242,13 @@ def evaluate(data_loader, rag_model, index=None, data_len=None, args=None, **kwa
                 batch,
                 dataset=data_loader.dataset,
                 docid2embs=docid2embs,
-                # docid2embs=docid2embs_page_reudced,
-                # docid2embs=docid2embs_token_reudced,
-                # docid2embs=docid2embs_page_token_reudced,
                 index=index,
                 token2pageuid=token2pageuid,
                 all_token_embeddings=all_token_embeddings,
                 n_return_pages=args.n_retrieval_pages,
                 args=args,
+                weaviate_client=weaviate_client,
+                weaviate_embed_model=weaviate_embed_model,
             )
 
             pred_answer = outputs["pred_answer"]
@@ -249,6 +300,11 @@ def main():
         Path(LOCAL_EMBEDDINGS_DIR)
         / f"{args.embedding_name}_pageindex_{args.faiss_index_type}"
     )
+    if not (local_index_dir / "index.bin").is_file():
+        alt = Path(LOCAL_EMBEDDINGS_DIR) / f"faiss_{args.embedding_name}"
+        if (alt / "index.bin").is_file():
+            logger.info(f"Using FAISS dir {alt} (found index.bin; canonical {local_index_dir} missing)")
+            local_index_dir = alt
     # local_answer_extraction_model_dir =  Path(LOCAL_MODEL_DIR) / args.answer_extraction_model_name_or_path
 
     if is_distributed():
@@ -281,9 +337,11 @@ def main():
                     f"Retrieval adapter model directory {local_retrieval_adapter_model_dir} does not exist"
                 )
 
-        if not local_index_dir.exists():
+        if not (local_index_dir / "index.bin").is_file():
             raise ValueError(
-                f"Index directory {local_index_dir} does not exist"
+                f"FAISS index not found at {local_index_dir / 'index.bin'} "
+                f"(expected .../{args.embedding_name}_pageindex_{args.faiss_index_type}/index.bin "
+                f"or .../faiss_{args.embedding_name}/index.bin)"
             )
 
     if is_distributed():
@@ -351,6 +409,9 @@ def main():
         import faiss
 
         index = faiss.read_index(str(local_index_dir / "index.bin"))
+        if args.faiss_index_type != "flatip" and hasattr(index, "nprobe"):
+            index.nprobe = int(args.faiss_nprobe)
+            logger.info(f"FAISS nprobe={index.nprobe}")
         logger.info("Loading faiss index -- done")
 
     def list_collate_fn(batch):
@@ -363,63 +424,89 @@ def main():
         dataset, batch_size=1, shuffle=False, collate_fn=list_collate_fn
     )
 
-    if args.retrieval_only:
-        retrieval_model.model, data_loader = accelerator.prepare(
-            retrieval_model.model, data_loader
+    weaviate_client = None
+    weaviate_embed_model = None
+    if args.use_weaviate_router:
+        try:
+            from sentence_transformers import SentenceTransformer
+
+            from m3docrag.retrieval.weaviate_mmqa import (
+                DEFAULT_EMBED_MODEL,
+                connect_weaviate,
+            )
+
+            weaviate_client = connect_weaviate()
+            weaviate_embed_model = SentenceTransformer(DEFAULT_EMBED_MODEL)
+            logger.info("Weaviate router: connected and BGE model loaded")
+        except Exception as e:
+            logger.warning(f"Weaviate router disabled (failed to connect or load BGE): {e}")
+
+    try:
+        if args.retrieval_only:
+            retrieval_model.model, data_loader = accelerator.prepare(
+                retrieval_model.model, data_loader
+            )
+        else:
+            # Keep ColPali on CPU during VQA so Qwen2-VL fits on a single consumer GPU.
+            retrieval_model.model = retrieval_model.model.to(torch.device("cpu"))
+            vqa_model.model, data_loader = accelerator.prepare(
+                vqa_model.model, data_loader
+            )
+            logger.info("Retrieval model on CPU; VQA model on accelerator device")
+
+        eval_out = evaluate(
+            data_loader=data_loader,
+            rag_model=rag_model,
+            index=index,
+            data_len=args.data_len,
+            args=args,
+            weaviate_client=weaviate_client,
+            weaviate_embed_model=weaviate_embed_model,
         )
-    else:
-        retrieval_model.model, data_loader, vqa_model.model = accelerator.prepare(
-            retrieval_model.model, data_loader, vqa_model.model
+
+        samples = eval_out
+
+        EST = pytz.timezone("US/Eastern")
+        experiment_date = (
+            datetime.datetime.now().astimezone(EST).strftime("%Y-%m-%d_%H-%M-%S")
         )
 
-    eval_out = evaluate(
-        data_loader=data_loader,
-        rag_model=rag_model,
-        index=index,
-        data_len=args.data_len,
-        args=args,
-    )
+        save_dir = Path(args.output_dir)
+        save_dir.mkdir(exist_ok=True, parents=True)
+        logger.info("Results will be saved at:", save_dir)
 
-    samples = eval_out
+        if args.retrieval_model_type == "colpali":
+            ret_name = args.retrieval_adapter_model_name_or_path
+        else:
+            ret_name = args.retrieval_model_name_or_path
 
-    EST = pytz.timezone("US/Eastern")
-    experiment_date = (
-        datetime.datetime.now().astimezone(EST).strftime("%Y-%m-%d_%H-%M-%S")
-    )
+        if args.retrieval_only:
+            pred_save_fname = f"{ret_name}_{args.faiss_index_type}_ret{args.n_retrieval_pages}_{experiment_date}.json"
+        else:
+            pred_save_fname = f"{ret_name}_{args.faiss_index_type}_ret{args.n_retrieval_pages}_{args.model_name_or_path}_{experiment_date}.json"
+        results_file = save_dir / pred_save_fname
+        with open(results_file, "w") as f:
+            json.dump(samples, f, indent=4)
 
-    save_dir = Path(args.output_dir)
-    save_dir.mkdir(exist_ok=True, parents=True)
-    logger.info("Results will be saved at:", save_dir)
+        logger.info(f"Prediction results saved at: {results_file}")
 
-    if args.retrieval_model_type == "colpali":
-        ret_name = args.retrieval_adapter_model_name_or_path
-    else:
-        ret_name = args.retrieval_model_name_or_path
+        # Evaluation
+        all_eval_scores = evaluate_prediction_file(
+            samples,
+            dataset.mmqa_data_path,  # '/job/datasets/m3-docvqa/MMQA_dev.jsonl'
+        )
+        if args.retrieval_only:
+            eval_save_fname = f"{ret_name}_{args.faiss_index_type}_ret{args.n_retrieval_pages}_{experiment_date}_eval_results.json"
+        else:
+            eval_save_fname = f"{ret_name}_{args.faiss_index_type}_ret{args.n_retrieval_pages}_{args.model_name_or_path}_{experiment_date}_eval_results.json"
+        results_file = save_dir / eval_save_fname
+        with open(results_file, "w") as f:
+            json.dump(all_eval_scores, f, indent=4)
 
-    if args.retrieval_only:
-        pred_save_fname = f"{ret_name}_{args.faiss_index_type}_ret{args.n_retrieval_pages}_{experiment_date}.json"
-    else:
-        pred_save_fname = f"{ret_name}_{args.faiss_index_type}_ret{args.n_retrieval_pages}_{args.model_name_or_path}_{experiment_date}.json"
-    results_file = save_dir / pred_save_fname
-    with open(results_file, "w") as f:
-        json.dump(samples, f, indent=4)
-
-    logger.info(f"Prediction results saved at: {results_file}")
-
-    # Evaluation
-    all_eval_scores = evaluate_prediction_file(
-        samples,
-        dataset.mmqa_data_path,  # '/job/datasets/m3-docvqa/MMQA_dev.jsonl'
-    )
-    if args.retrieval_only:
-        eval_save_fname = f"{ret_name}_{args.faiss_index_type}_ret{args.n_retrieval_pages}_{experiment_date}_eval_results.json"
-    else:
-        eval_save_fname = f"{ret_name}_{args.faiss_index_type}_ret{args.n_retrieval_pages}_{args.model_name_or_path}_{experiment_date}_eval_results.json"
-    results_file = save_dir / eval_save_fname
-    with open(results_file, "w") as f:
-        json.dump(all_eval_scores, f, indent=4)
-
-    logger.info(f"Evaluation results saved at: {results_file}")
+        logger.info(f"Evaluation results saved at: {results_file}")
+    finally:
+        if weaviate_client is not None:
+            weaviate_client.close()
 
     if is_distributed():
         barrier()

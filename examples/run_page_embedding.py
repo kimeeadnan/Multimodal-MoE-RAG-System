@@ -67,7 +67,7 @@ def main():
         Path(LOCAL_MODEL_DIR) / args.retrieval_adapter_model_name_or_path
     )
 
-    # Download datasets / model checkpoints
+    #download dataset
     if not is_distributed() or global_rank() == 0:
         if not local_data_dir.exists():
             raise ValueError(f"Data directory {local_data_dir} does not exist")
@@ -132,9 +132,18 @@ def main():
         if args.data_name == "mp-docvqa":
             page_name = datum["page_name"][0]
             logger.info(page_name)
+            local_save_fname = f"{page_name}.safetensors"
         else:
             doc_id = datum["doc_id"][0]
             logger.info(doc_id)
+            local_save_fname = f"{doc_id}.safetensors"
+
+        local_save_path = save_dir / local_save_fname
+
+        # Skip if this document/page was already processed
+        if local_save_path.exists():
+            logger.info(f"Skipping {local_save_path} (already exists)")
+            continue
 
         if args.retrieval_model_type == "colpali":
             images = datum["images"][0]
@@ -155,13 +164,6 @@ def main():
         logger.info(doc_embs.shape)
         if args.retrieval_model_type == "colpali":
             logger.info(doc_embs[0, 0, :5])
-
-        # Save the embedding
-        if args.data_name == "mp-docvqa":
-            local_save_fname = f"{page_name}.safetensors"
-        else:
-            local_save_fname = f"{doc_id}.safetensors"
-        local_save_path = save_dir / local_save_fname
 
         if args.retrieval_model_type == "colpali":
             safetensors.torch.save_file({"embeddings": doc_embs}, local_save_path)
