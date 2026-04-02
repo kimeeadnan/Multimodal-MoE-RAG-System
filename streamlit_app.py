@@ -2,6 +2,12 @@ import streamlit as st
 
 from m3docrag.serve.single_query_service import SingleQueryConfig, SingleQueryM3DocVQAService
 
+from pathlib import Path
+import jsonlines
+
+from m3docrag.datasets.m3_docvqa.evaluate import eval_retrieval, evaluate_predictions
+from m3docrag.utils.paths import LOCAL_DATA_DIR
+
 
 st.set_page_config(page_title="M3DocVQA RAG Demo", layout="wide")
 st.title("M3DocVQA RAG demo (ColPali + FAISS + Qwen2-VL)")
@@ -62,7 +68,57 @@ def get_service(
     return SingleQueryM3DocVQAService(cfg)
 
 
-question = st.text_area("Question", height=90, placeholder="Type a question about the M3DocVQA documents...")
+st.sidebar.markdown("## Ground truth (metrics)")
+use_gold_question = st.sidebar.checkbox(
+    "Use a gold question from MMQA_*jsonl for metric scoring", value=True
+)
+gold_load_limit = st.sidebar.number_input(
+    "Max gold examples to load (for selector)",
+    min_value=1,
+    max_value=10000,
+    value=300,
+    step=50,
+)
+
+
+@st.cache_data(show_spinner=True)
+def load_gold_examples(data_name: str, split: str, limit: int):
+    mmqa_path = (
+        Path(LOCAL_DATA_DIR)
+        / data_name
+        / "multimodalqa"
+        / f"MMQA_{split}.jsonl"
+    )
+    examples = []
+    with jsonlines.open(mmqa_path) as reader:
+        for i, obj in enumerate(reader):
+            examples.append(obj)
+            if limit and i + 1 >= int(limit):
+                break
+    return examples
+
+
+gold_examples = load_gold_examples("m3-docvqa", split, int(gold_load_limit))
+gold_idx = 0
+selected_gold = None
+if use_gold_question and len(gold_examples) > 0:
+    gold_idx = st.sidebar.number_input(
+        "Gold example index",
+        min_value=0,
+        max_value=max(0, len(gold_examples) - 1),
+        value=min(0, len(gold_examples) - 1),
+        step=1,
+    )
+    selected_gold = gold_examples[int(gold_idx)]
+
+question_default = selected_gold["question"] if selected_gold is not None else ""
+question = st.text_area(
+    "Question",
+    height=90,
+    placeholder="Type a question about the M3DocVQA documents...",
+    value=question_default,
+    disabled=use_gold_question,
+)
 
 run = st.button("Answer", type="primary")
 
@@ -86,6 +142,40 @@ if run and question.strip():
 
     st.subheader("Answer")
     st.write(out["pred_answer"])
+
+    if selected_gold is not None:
+        st.subheader("Gold / metrics (single example)")
+        gold_answers = [str(item["answer"]) for item in selected_gold["answers"]]
+        st.markdown("**Gold answer(s):**")
+        st.write(gold_answers)
+
+        qid = selected_gold["qid"]
+        predicted_answers = {qid: out["pred_answer"].strip()}
+        gold_answer_map = {qid: gold_answers}
+
+        # Generation metrics
+        gen_scores, _ = evaluate_predictions(predicted_answers, gold_answer_map)
+
+        st.markdown("**Generation metrics (list_*):**")
+        st.json(
+            {
+                "list_em": gen_scores.get("list_em"),
+                "list_f1": gen_scores.get("list_f1"),
+            }
+        )
+
+        # Retrieval metrics (doc-level recall from supporting_context doc_id)
+        retrieval_results_for_eval = {
+            qid: [
+                [doc_id, page_idx, score]
+                for (doc_id, page_idx, score) in out["page_retrieval_results_raw"]
+            ]
+        }
+        retrieval_scores = eval_retrieval(
+            retrieval_results_for_eval, [selected_gold], recall_levels=[1, 2, 4, 5, 10]
+        )
+        st.markdown("**Retrieval metrics:**")
+        st.json(retrieval_scores["average_recall_at_k"])
 
     st.subheader("Router diagnostics")
     st.json(

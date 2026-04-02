@@ -269,6 +269,8 @@ class SingleQueryM3DocVQAService:
             "router_reason": plan.reason,
             "router_features": features_to_dict(plan.features),
             "router_doc_ids_filter": plan.doc_ids_filter,
+            # Raw (doc_id, page_idx, score) tuples for metric computation.
+            "page_retrieval_results_raw": retrieval_results,
             "page_retrieval_results": [
                 {"doc_id": doc_id, "page_idx": page_idx, "score": score}
                 for (doc_id, page_idx, score) in retrieval_results

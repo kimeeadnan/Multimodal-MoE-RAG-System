@@ -4,7 +4,7 @@
 
 This file is the living **progress report** for the repo: it combines a **technical walkthrough** (ColPali page embeddings, FAISS, Weaviate) with **current integration status**, **limitations**, and **evaluation metrics**. It replaces the former `COLPALI_PAGE_EMBEDDINGS_M3DOCVQA.md`.
 
-**Contents:** §§1–6 — indexing and storage; §7 — MoE router + Qwen2-VL + low-memory FAISS path; §8 — run commands; §9 — limitations; §10 — latest dev eval numbers; §11 — changelog + ready-to-run commands.
+**Contents:** §§1–6 — indexing and storage; §7 — MoE router + Qwen2-VL + low-memory FAISS path; §8 — run commands; §9 — limitations; §10 — latest dev eval numbers; §11 — changelog + ready-to-run commands; §12 — current pipeline walkthrough; §13 — future work.
 
 ---
 
@@ -519,3 +519,142 @@ python examples/run_rag_m3docvqa.py \
 ```
 
 **Weaviate-off ablation:** remove `--use_weaviate_router`; Weaviate env vars optional.
+
+---
+## 12. Current pipeline walkthrough (end-to-end)
+
+This is what runs *today* end-to-end for a query.
+
+### 12.1 Offline: build everything we need
+
+1. **ColPali page embeddings (visual)**
+   - Input: each PDF in `m3-docvqa/splits/pdfs_dev/*.pdf`
+   - For every `doc_id`:
+     - convert each PDF page to an image
+     - run ColPali to produce per-page embeddings
+   - Saved as one safetensors file per document:
+     - `embeddings/colpali_m3docvqa_dev/<doc_id>.safetensors`
+     - tensor shape: `[n_pages, n_tokens, 128]`
+
+2. **FAISS index (visual retrieval)**
+   - We flatten all token vectors into one FAISS index (`IndexIVFFlat` for `ivfflat`)
+   - The FAISS index stores token vectors in embedding space (dim=128)
+   - Key design: tokens are mapped back to page IDs via `token2pageuid`.
+
+3. **Weaviate MMQA text chunks (text/keyword retrieval)**
+   - Weaviate collection: `MmqTextChunk`
+   - Each chunk stores:
+     - `doc_id` (maps chunk -> PDF doc)
+     - BM25-indexed `text`
+     - dense vectors (BGE-small)
+
+### 12.2 Online: answer one question
+
+Given a query `q`, the runtime flow is:
+
+1. **Route selection (MoE router)**
+   - Router experts: `visual`, `text`, `keyword`
+   - Router uses heuristic features / structural cues from the question.
+   - Output saved for debugging:
+     - `router_expert`, `router_reason`, `router_features`, `router_doc_ids_filter`
+
+2. **(Optional) Weaviate doc-ID narrowing**
+   - If the router picks `text` or `keyword` and `--use_weaviate_router` is enabled:
+     - Weaviate searches chunks for query relevance
+     - produces a set of candidate PDF `doc_id`s
+   - These `doc_id`s are used as an allow-list to filter visual retrieval.
+
+3. **ColPali + FAISS page retrieval**
+   - Regardless of the router, the final “evidence unit” for the VLM is a set of **pages**.
+   - Retrieval uses FAISS token-nearest-neighbors + MaxSim-style aggregation:
+     - For each query token, FAISS returns nearest token vectors
+     - we aggregate scores into page scores using `token2pageuid`
+     - then select top `n_retrieval_pages` pages to feed the VLM.
+
+4. **Low-memory FAISS mode**
+   - When FAISS exists and we are in the ColPali path:
+     - we avoid rebuilding the full flattened `all_token_embeddings` tensor
+     - instead we build `token2pageuid` by reading only safetensor shapes
+     - FAISS `D` scores are used directly (no giant embedding reconstruction)
+
+5. **Generation (VQA)**
+   - We load the retrieved page images from PDFs (page_idx for each doc_id)
+   - VQA model: `Qwen2-VL-7B-Instruct` (4-bit when `--bits=4`)
+   - The question is wrapped into a short-answer prompt (unless Florence path)
+   - Output saved as `pred_answer`
+
+### 12.3 Metrics (how we know it works)
+
+We evaluate two things:
+
+1. **Retrieval quality**
+   - Metric: `recall@K` where K in `{1,2,4,5,10}`
+   - Gold source: `supporting_context[].doc_id` from `MMQA_<split>.jsonl`
+   - Prediction source: the top retrieved pages -> unique doc_ids in top-K
+
+2. **Generation quality**
+   - Metric: `list_em` and `list_f1`
+   - Gold source: `answers[].answer` for each question in `MMQA_<split>.jsonl`
+   - Prediction source: `pred_answer` produced by the VLM
+
+### 12.4 Latest results snapshot (dev split)
+
+Two recorded runs you currently have in the repo:
+
+1. `ret1` (top-1 page): `2026-04-01_22-23-21`
+   - `list_em`: 21.63%
+   - `list_f1`: 25.38%
+   - `recall@1`: 0.4999
+
+2. `ret3` (top-3 pages): `2026-04-02_01-24-43`
+   - `list_em`: 24.78%
+   - `list_f1`: 29.35%
+   - `recall@1`: 0.5479
+
+Interpretation: the pipeline is working end-to-end, and improving retrieval coverage (`n_retrieval_pages`) gives a measurable lift.
+
+---
+## 13. Future work (next improvements)
+
+### 13.1 Router improvements (most important “incompleteness”)
+
+- Reduce false negatives from Weaviate filtering:
+  - add a fallback when the allow-list removes too much evidence
+- Calibrate router thresholds / top-k docs:
+  - ensure `weaviate_top_k_docs` is large enough for recall
+- Consider learned gating:
+  - replace some heuristics with a lightweight classifier, or
+  - add an “unsure -> retrieve visual” fallback.
+
+### 13.2 Retrieval improvements
+
+- Increase `n_retrieval_pages` further (if VRAM allows), since current gains track recall improvements.
+- Tune FAISS query-time parameters:
+  - raise `faiss_nprobe` for IVF indexes
+  - optionally test exact `flatip` on smaller subsets / smaller splits
+- Improve MaxSim aggregation:
+  - expose and tune `faiss_search_k` (how many token neighbors per query token)
+- Add fusion:
+  - fuse visual page scores with text/keyword scores (instead of hard filtering only).
+
+### 13.3 Generation improvements
+
+- If retrieval is stronger, try:
+  - higher `max_new_tokens`
+  - better prompt template / constrained answer formatting
+  - cache retrieved page embeddings or images across questions when possible
+- Consider a larger VLM only after retrieval is stable.
+
+### 13.4 Indexing / operational improvements
+
+- Support incremental indexing:
+  - upload a new PDF and update embeddings + FAISS without full rebuild
+- Store reusable metadata:
+  - persist `token2pageuid` and shapes for faster startup
+
+### 13.5 UI / demo improvements (for presenting)
+
+- Streamlit should display:
+  - retrieved page images (thumbnails)
+  - highlighted page order + scores
+  - optional side-by-side comparison vs gold answer
